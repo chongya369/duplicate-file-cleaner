@@ -89,7 +89,7 @@ server:
 
 services:
   dupfinder:
-    image: chongya369/dedup:0.8.0
+    image: chongya369/dedup:latest
     container_name: dupfinder
     restart: unless-stopped
     ports:
