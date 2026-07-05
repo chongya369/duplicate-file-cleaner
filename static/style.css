@@ -243,6 +243,23 @@ html, body {
 }
 .panel-title { font-weight: 700; font-size: 14px; }
 .panel-count { font-size: 12px; color: var(--text-secondary); }
+.hash-stats {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-left: 8px;
+}
+.hash-stats .hash-ok { color: #27ae60; }
+.hash-stats .hash-fail { color: #c0392b; font-weight: 600; }
+.hash-filter {
+    font-size: 11px;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+    margin-left: 8px;
+}
 
 .panel-body {
     flex: 1;
@@ -285,6 +302,17 @@ html, body {
     flex-shrink: 0;
     color: var(--text-secondary);
     font-size: 12px;
+}
+.file-row .f-hash {
+    width: 50px;
+    text-align: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    color: #27ae60;
+}
+.file-row .f-hash.hash-fail {
+    color: #c0392b;
+    font-weight: 700;
 }
 .file-row .f-path {
     width: 200px;
@@ -361,6 +389,13 @@ html, body {
     flex-shrink: 0;
     color: var(--text-secondary);
     font-size: 12px;
+}
+.dup-file-row .f-hash {
+    width: 50px;
+    text-align: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    color: #27ae60;
 }
 .dup-file-row .f-path {
     width: 180px;
@@ -588,6 +623,9 @@ html, body {
 .col-headers .col-h-size {
     width: 80px; text-align: right; flex-shrink: 0;
 }
+.col-headers .col-h-hash {
+    width: 50px; text-align: center; flex-shrink: 0;
+}
 .col-headers .col-h-divider {
     position: relative;
     flex-shrink: 0;
@@ -629,3 +667,51 @@ html, body {
     gap: 6px;
 }
 .panel-right .col-headers .col-h-size { width: 70px; }
+
+/* ───────── 分页栏 ───────── */
+.pagination-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    background: #fafbfd;
+    flex-shrink: 0;
+}
+.pagination-bar .page-info {
+    font-size: 13px;
+    color: var(--text-secondary);
+    min-width: 90px;
+    text-align: center;
+    user-select: none;
+}
+.btn-page {
+    font-size: 12px;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+    transition: all var(--transition);
+    user-select: none;
+}
+.btn-page:hover:not(:disabled) {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+}
+.btn-page:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ───────── Hash 失败行 ───────── */
+.file-row.hash-error-row {
+    background: #fff5f5;
+    opacity: 0.8;
+}
+.file-row.hash-error-row .f-name {
+    color: #c0392b;
+}

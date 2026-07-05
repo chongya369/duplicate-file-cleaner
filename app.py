@@ -37,6 +37,15 @@ v0.7.0 更新:
 v0.7.1 更新:
     - 两阶段哈希：先 partial hash 快速筛选，仅对疑似重复文件做全量 SHA-256
     - 多线程并行哈希，充分利用多核 CPU 加速大文件库扫描
+
+v0.7.2 更新:
+    - 扫描过程中实时显示文件列表（每 100 个文件增量更新，无需等待扫描完成）
+    - 修复无密码模式下文件夹浏览功能（Cookie 未设置导致 401）
+    - 优化大文件夹扫描性能：有界队列 + 安全入队 + 进度节流，防止内存暴涨和界面卡死
+
+v0.8.0 更新:
+    - 左侧文件列表采用分页显示（每页 100 条），彻底解决大量文件时页面卡顿
+    - 扫描过程中实时追加文件，扫描完成后原地更新重复/保留状态
 """
 
 import os
@@ -60,7 +69,7 @@ import yaml
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context, redirect, make_response
 
 # ────────────────── 版本 ──────────────────
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 # ────────────────── 配置 ──────────────────
 DEFAULT_PORT = 36901
@@ -414,7 +423,7 @@ def api_scan():
         return jsonify({"error": "无效的文件夹路径"}), 400
 
     scan_id = _new_scan_id()
-    event_queue = queue.Queue()
+    event_queue = queue.Queue(maxsize=1000)  # 限制队列大小，防止内存溢出
 
     with _session_lock:
         _sessions[scan_id] = {
@@ -442,6 +451,13 @@ def api_scan():
 def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
     """后台扫描线程"""
 
+    def _safe_put(q, msg, timeout=1.0):
+        """安全地放入队列，超时则丢弃（防止扫描线程阻塞）"""
+        try:
+            q.put(msg, timeout=timeout)
+        except queue.Full:
+            logger.debug("事件队列已满，丢弃事件")
+
     def _wait_if_paused():
         """暂停时阻塞，恢复后返回。取消时返回 True"""
         notified = False
@@ -453,11 +469,11 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
                 if not session.get("paused"):
                     break
             if not notified:
-                q.put(json.dumps({"type": "paused", "message": "扫描已暂停"}))
+                _safe_put(q, json.dumps({"type": "paused", "message": "扫描已暂停"}))
                 notified = True
             time.sleep(0.3)
         if notified:
-            q.put(json.dumps({"type": "resumed", "message": "扫描继续…"}))
+            _safe_put(q, json.dumps({"type": "resumed", "message": "扫描继续…"}))
         return False
 
     with _session_lock:
@@ -468,13 +484,13 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
 
     try:
         # 阶段 1：收集文件
-        q.put(json.dumps({"type": "phase", "phase": "collect", "message": "正在收集文件列表…"}))
+        _safe_put(q, json.dumps({"type": "phase", "phase": "collect", "message": "正在收集文件列表…"}))
         raw_files = []
         if recursive:
             for dirpath, _dirs, filenames in os.walk(folder):
                 # 检查是否已取消或暂停
                 if _wait_if_paused():
-                    q.put(json.dumps({"type": "cancelled", "message": "扫描已停止"}))
+                    _safe_put(q, json.dumps({"type": "cancelled", "message": "扫描已停止"}))
                     with _session_lock:
                         if scan_id in _sessions:
                             _sessions[scan_id]["status"] = "cancelled"
@@ -506,7 +522,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
             if scan_id in _sessions:
                 _sessions[scan_id]["all_files"] = all_files
 
-        q.put(json.dumps({
+        _safe_put(q, json.dumps({
             "type": "phase",
             "phase": "collect_done",
             "message": f"已列出 {len(all_files)} 个文件",
@@ -514,7 +530,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
         }))
 
         # 阶段 2：按大小分组
-        q.put(json.dumps({"type": "phase", "phase": "hash", "message": "正在计算文件哈希…"}))
+        _safe_put(q, json.dumps({"type": "phase", "phase": "hash", "message": "正在计算文件哈希…"}))
         size_groups = defaultdict(list)
         for fp, sz in all_files:
             size_groups[sz].append(fp)
@@ -524,7 +540,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
         total_bytes = sum(sz * len(paths) for sz, paths in candidates.items())
 
         if total_candidates == 0:
-            q.put(json.dumps({
+            _safe_put(q, json.dumps({
                 "type": "done",
                 "duplicate_groups": [],
                 "total_groups": 0,
@@ -542,7 +558,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
         hash_errors = 0
 
         # ── 阶段 3a：并行计算 partial hash，快速排除唯一文件 ──
-        q.put(json.dumps({
+        _safe_put(q, json.dumps({
             "type": "phase",
             "phase": "partial_hash",
             "message": f"正在快速筛选文件指纹（{n_workers} 线程并行）…",
@@ -555,6 +571,8 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
 
         def _worker_partial(item):
             fp, sz = item
+            if _wait_if_paused():
+                return None  # cancelled
             with _session_lock:
                 session = _sessions.get(scan_id)
                 if session and session.get("cancel_requested"):
@@ -563,20 +581,24 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
             with partial_lock:
                 nonlocal partial_done
                 partial_done += 1
-                pct = int(partial_done / total_candidates * 100)
-                q.put(json.dumps({
-                    "type": "progress",
-                    "progress": pct,
-                    "current": f"{partial_done}/{total_candidates}",
-                    "total": f"{total_candidates} 个候选文件",
-                    "current_files": partial_done,
-                    "total_files": total_candidates,
-                }))
+                # 节流：每 1% 或每 10 个文件发送一次进度（取较小频率）
+                if partial_done % max(1, total_candidates // 100) == 0 or partial_done % 10 == 0 or partial_done == total_candidates:
+                    pct = int(partial_done / total_candidates * 100)
+                    _safe_put(q, json.dumps({
+                        "type": "progress",
+                        "progress": pct,
+                        "current": f"{partial_done}/{total_candidates}",
+                        "total": f"{total_candidates} 个候选文件",
+                        "current_files": partial_done,
+                        "total_files": total_candidates,
+                    }))
             return (fp, sz, h)
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             all_items = [(fp, sz) for sz, paths in candidates.items() for fp in paths]
             futures = {pool.submit(_worker_partial, item): item for item in all_items}
+            files_since_update = 0
+            batch_files = []
             for future in as_completed(futures):
                 result = future.result()
                 if result is None:
@@ -584,16 +606,33 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
                 fp, sz, h = result
                 if h:
                     partial_groups[h].append((fp, sz))
+                    batch_files.append({"path": fp, "size": sz, "status": "normal"})
                 else:
                     with partial_lock:
                         hash_errors += 1
+                    batch_files.append({"path": fp, "size": sz, "status": "hash_error"})
                     logger.debug("Partial hash 失败: %s", fp)
+                files_since_update += 1
+                # 每 100 个文件发送一次增量更新
+                if files_since_update >= 100:
+                    _safe_put(q, json.dumps({
+                        "type": "files_update",
+                        "files": batch_files,
+                    }))
+                    batch_files = []
+                    files_since_update = 0
+            # 发送剩余的批次
+            if batch_files:
+                _safe_put(q, json.dumps({
+                    "type": "files_update",
+                    "files": batch_files,
+                }))
 
         # 检查取消
         with _session_lock:
             session = _sessions.get(scan_id)
             if session and session.get("cancel_requested"):
-                q.put(json.dumps({"type": "cancelled", "message": "扫描已停止"}))
+                _safe_put(q, json.dumps({"type": "cancelled", "message": "扫描已停止"}))
                 session["status"] = "cancelled"
                 return
 
@@ -606,7 +645,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
             logger.info("Partial hash 筛选：跳过 %d 个唯一文件，剩余 %d 个需全量哈希", skipped, full_hash_candidates)
 
         if full_hash_candidates == 0:
-            q.put(json.dumps({
+            _safe_put(q, json.dumps({
                 "type": "done",
                 "duplicate_groups": [],
                 "total_groups": 0,
@@ -620,7 +659,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
             return
 
         # ── 阶段 3b：对筛选后的文件并行计算全量 SHA-256 ──
-        q.put(json.dumps({
+        _safe_put(q, json.dumps({
             "type": "phase",
             "phase": "full_hash",
             "message": f"正在计算文件哈希（{full_hash_candidates} 个文件，{n_workers} 线程并行）…",
@@ -634,6 +673,8 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
 
         def _worker_full(item):
             fp, sz = item
+            if _wait_if_paused():
+                return None  # cancelled
             with _session_lock:
                 session = _sessions.get(scan_id)
                 if session and session.get("cancel_requested"):
@@ -643,15 +684,17 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
                 nonlocal full_done, full_done_bytes
                 full_done += 1
                 full_done_bytes += sz
-                pct = int(full_done_bytes / total_bytes * 100) if total_bytes > 0 else 100
-                q.put(json.dumps({
-                    "type": "progress",
-                    "progress": pct,
-                    "current": format_size(full_done_bytes),
-                    "total": format_size(total_bytes),
-                    "current_files": full_done,
-                    "total_files": full_hash_candidates,
-                }))
+                # 节流：每 1% 或每 10 个文件发送一次进度（取较小频率）
+                if full_done % max(1, full_hash_candidates // 100) == 0 or full_done % 10 == 0 or full_done == full_hash_candidates:
+                    pct = int(full_done_bytes / total_bytes * 100) if total_bytes > 0 else 100
+                    _safe_put(q, json.dumps({
+                        "type": "progress",
+                        "progress": pct,
+                        "current": format_size(full_done_bytes),
+                        "total": format_size(total_bytes),
+                        "current_files": full_done,
+                        "total_files": full_hash_candidates,
+                    }))
             return (fp, h)
 
         full_items = [(fp, sz) for items in need_full_hash.values() for fp, sz in items]
@@ -717,7 +760,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
                 _sessions[scan_id]["dup_file_set"] = dup_file_set
                 _sessions[scan_id]["status"] = "done"
 
-        q.put(json.dumps({
+        _safe_put(q, json.dumps({
             "type": "done",
             "duplicate_groups": duplicate_groups,
             "total_groups": len(duplicate_groups),
@@ -730,7 +773,7 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
     except Exception as e:
         logger.error("扫描线程异常 scan_id=%s: %s\n%s", scan_id, e, traceback.format_exc())
         # 推送错误事件给前端
-        q.put(json.dumps({
+        _safe_put(q, json.dumps({
             "type": "error",
             "message": f"扫描出错: {e}",
         }))

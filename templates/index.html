@@ -66,17 +66,29 @@
             <div class="panel-header">
                 <span class="panel-title">📋 所有文件</span>
                 <span class="panel-count" id="file-count">共 0 个文件</span>
+                <span class="hash-stats" id="hash-stats"></span>
+                <select class="hash-filter" id="hash-filter" style="display:none">
+                    <option value="all">全部</option>
+                    <option value="success">Hash 成功</option>
+                    <option value="fail">Hash 失败</option>
+                </select>
             </div>
             <div class="panel-body" id="all-files-container">
                 <div class="col-headers" id="left-col-headers" style="display:none">
                     <span class="col-h-name">文件名</span>
                     <span class="col-h-size">大小</span>
+                    <span class="col-h-hash">Hash</span>
                     <span class="col-h-divider">
                         <span class="col-h-handle" data-panel="left"></span>
                     </span>
                     <span class="col-h-path">路径</span>
                 </div>
                 <div class="file-list-body" id="left-file-list"></div>
+                <div class="pagination-bar" id="pagination-bar" style="display:none">
+                    <button class="btn btn-page" id="btn-prev-page">‹ 上一页</button>
+                    <span class="page-info" id="page-info">第 1 / 1 页</span>
+                    <button class="btn btn-page" id="btn-next-page">下一页 ›</button>
+                </div>
                 <div class="placeholder" id="left-placeholder">
                     选择一个文件夹<br>点击「开始扫描」即可检测重复文件
                 </div>
@@ -93,12 +105,18 @@
                 <div class="col-headers" id="right-col-headers" style="display:none">
                     <span class="col-h-name">文件名</span>
                     <span class="col-h-size">大小</span>
+                    <span class="col-h-hash">Hash</span>
                     <span class="col-h-divider">
                         <span class="col-h-handle" data-panel="right"></span>
                     </span>
                     <span class="col-h-path">路径</span>
                 </div>
                 <div class="file-list-body" id="right-file-list"></div>
+                <div class="pagination-bar" id="right-pagination-bar" style="display:none">
+                    <button class="btn btn-page" id="btn-dup-prev-page">‹ 上一页</button>
+                    <span class="page-info" id="dup-page-info">第 1 / 1 页</span>
+                    <button class="btn btn-page" id="btn-dup-next-page">下一页 ›</button>
+                </div>
                 <div class="placeholder" id="right-placeholder">
                     扫描结果将显示在这里
                 </div>
@@ -111,7 +129,7 @@
         <div class="bottom-left">
             <span class="summary" id="summary-text"></span>
             <a href="/logout" class="github-link" title="退出登录">退出</a>
-            <a href="https://github.com/" target="_blank" class="github-link" title="GitHub 仓库">
+            <a href="https://github.com/chongya369/duplicate-file-cleaner/" target="_blank" class="github-link" title="GitHub 仓库">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="vertical-align: -2px;">
                     <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
                 </svg>

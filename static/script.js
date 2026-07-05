@@ -39,6 +39,8 @@ const rightFileList = $("#right-file-list");
 const leftColHeaders = $("#left-col-headers");
 const rightColHeaders = $("#right-col-headers");
 const fileCount = $("#file-count");
+const hashStats = $("#hash-stats");
+const hashFilter = $("#hash-filter");
 const dupCount = $("#dup-count");
 const summaryText = $("#summary-text");
 const btnRescan = $("#btn-rescan");
@@ -51,12 +53,29 @@ const contextMenu = $("#context-menu");
 const toast = $("#toast");
 const loadingOverlay = $("#loading-overlay");
 const hoverTooltip = $("#hover-tooltip");
+const paginationBar = $("#pagination-bar");
+const btnPrevPage = $("#btn-prev-page");
+const btnNextPage = $("#btn-next-page");
+const pageInfo = $("#page-info");
+const rightPaginationBar = $("#right-pagination-bar");
+const btnDupPrevPage = $("#btn-dup-prev-page");
+const btnDupNextPage = $("#btn-dup-next-page");
+const dupPageInfo = $("#dup-page-info");
 
 // ───────── 状态 ─────────
 let scanId = null;
 let scanData = null;       // 来自 /api/scan/<id>/details 的完整数据
 let ctxFilePath = null;    // 右键目标路径
 let toastTimer = null;
+let _allFiles = [];        // 所有文件的完整数据（内存中维护）
+let _currentPage = 1;      // 当前页码（从 1 开始）
+const _pageSize = 100;     // 每页显示文件数
+let _currentPhaseMsg = ""; // 当前阶段文字（用于进度显示，避免累积）
+let _dupCurrentPage = 1;   // 重复组当前页码
+const _dupPageSize = 50;   // 重复组每页显示数
+let _hashSuccessCount = 0; // Hash 成功文件数
+let _hashFailCount = 0;    // Hash 失败文件数
+let _hashFilterValue = "all"; // Hash 筛选：all / success / fail
 
 // 列宽（持久化，扫描后不重置）
 const colWidths = {
@@ -441,6 +460,7 @@ function listenProgress(sid) {
 function handleProgress(msg) {
     switch (msg.type) {
         case "phase":
+            _currentPhaseMsg = msg.message;
             progressText.textContent = msg.message;
             if (msg.file_count !== undefined) {
                 fileCount.textContent = `共 ${msg.file_count} 个文件`;
@@ -448,11 +468,17 @@ function handleProgress(msg) {
             break;
         case "progress":
             progressFill.style.width = msg.progress + "%";
-            // 根据当前阶段显示不同的进度文本
+            // 替换而非追加，避免文字不断累积
             if (msg.total_files && msg.current_files !== undefined) {
-                progressText.textContent = `${progressText.textContent} ${msg.current_files}/${msg.total_files}`;
+                progressText.textContent = `${_currentPhaseMsg} ${msg.progress}%  ${msg.current_files}/${msg.total_files}`;
             } else if (msg.current && msg.total) {
-                progressText.textContent = `${progressText.textContent} ${msg.current} / ${msg.total}`;
+                progressText.textContent = `${_currentPhaseMsg} ${msg.progress}%  ${msg.current} / ${msg.total}`;
+            }
+            break;
+        case "files_update":
+            // 增量更新文件列表
+            if (msg.files && msg.files.length > 0) {
+                appendFilesToList(msg.files);
             }
             break;
         case "paused":
@@ -462,6 +488,7 @@ function handleProgress(msg) {
             break;
         case "resumed":
             progressText.style.color = "";
+            btnPause.disabled = false;
             btnPause.textContent = "⏸ 暂停";
             break;
         case "done":
@@ -473,6 +500,7 @@ function handleProgress(msg) {
             btnScan.disabled = false;
             btnRescan.disabled = false;
             btnPause.disabled = true;
+            btnPause.textContent = "⏸ 暂停";
             btnStop.disabled = true;
             scanId = null;
             break;
@@ -564,9 +592,67 @@ async function onScanComplete(sid) {
     try {
         const resp = await fetch(`/api/scan/${sid}/details`);
         scanData = await resp.json();
-        renderAllFiles(scanData.all_files);
+
+        if (_allFiles.length > 0) {
+            // 已有增量数据，更新 _allFiles 中每条记录的状态和相对路径
+            const fileMap = {};
+            scanData.all_files.forEach(f => { fileMap[f.path] = f; });
+
+            _allFiles.forEach(f => {
+                const server = fileMap[f.path];
+                if (server) {
+                    f.status = server.status;
+                    f.rel = server.rel;
+                    f.size_str = server.size_str;
+                    f.name = server.name;
+                }
+            });
+
+            // 补充增量阶段遗漏的文件（如 SSE 断连、hash失败未发送等）
+            const existingPaths = new Set(_allFiles.map(f => f.path));
+            let added = 0;
+            scanData.all_files.forEach(f => {
+                if (!existingPaths.has(f.path)) {
+                    _allFiles.push({
+                        path: f.path,
+                        name: f.name,
+                        size: f.size,
+                        size_str: f.size_str,
+                        rel: f.rel,
+                        status: f.status || "normal",
+                    });
+                    added++;
+                }
+            });
+        } else if (scanData.all_files && scanData.all_files.length > 0) {
+            // 没有增量数据（如恢复上次扫描），从服务端数据填充 _allFiles
+            _allFiles = scanData.all_files.map(f => ({
+                path: f.path,
+                name: f.name,
+                size: f.size,
+                size_str: f.size_str,
+                rel: f.rel,
+                status: f.status || "normal",
+            }));
+            leftPlaceholder.style.display = "none";
+            leftColHeaders.style.display = "flex";
+            paginationBar.style.display = "flex";
+        }
+
+        // 重新计算 hash 成功/失败数量
+        _hashSuccessCount = 0;
+        _hashFailCount = 0;
+        _allFiles.forEach(f => {
+            if (f.status === "hash_error") _hashFailCount++;
+            else _hashSuccessCount++;
+        });
+
+        // 显示筛选框并更新计数
+        hashFilter.style.display = "inline-block";
+        _updateFileCountDisplay();
+
+        renderCurrentPage();
         renderDuplicateGroups(scanData.duplicate_groups);
-        fileCount.textContent = `共 ${scanData.total_files} 个文件`;
 
         if (scanData.total_groups === 0) {
             rightPlaceholder.style.display = "block";
@@ -586,6 +672,16 @@ async function onScanComplete(sid) {
 }
 
 function resetUI() {
+    _allFiles = [];
+    _currentPage = 1;
+    _allDupGroups = [];
+    _dupCurrentPage = 1;
+    _hashSuccessCount = 0;
+    _hashFailCount = 0;
+    _hashFilterValue = "all";
+    hashFilter.value = "all";
+    hashFilter.style.display = "none";
+    hashStats.innerHTML = "";
     leftPlaceholder.style.display = "none";
     rightPlaceholder.style.display = "block";
     rightPlaceholder.textContent = "扫描结果将显示在这里";
@@ -595,6 +691,8 @@ function resetUI() {
     rightFileList.innerHTML = "";
     leftColHeaders.style.display = "none";
     rightColHeaders.style.display = "none";
+    paginationBar.style.display = "none";
+    rightPaginationBar.style.display = "none";
     fileCount.textContent = "共 0 个文件";
     dupCount.textContent = "";
     summaryText.textContent = "";
@@ -603,59 +701,204 @@ function resetUI() {
     scanData = null;
 }
 
-// ───────── 渲染左侧文件列表 ─────────
-function renderAllFiles(files) {
-    leftFileList.innerHTML = "";
-    leftPlaceholder.style.display = "none";
-    leftColHeaders.style.display = files.length > 0 ? "flex" : "none";
+// ───────── 格式化文件大小 ─────────
+function formatFileSize(bytes) {
+    if (bytes === 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let val = bytes;
+    for (let i = 0; i < units.length; i++) {
+        if (val < 1024) return val.toFixed(1) + " " + units[i];
+        val /= 1024;
+    }
+    return val.toFixed(1) + " PB";
+}
+
+// ───────── 增量追加文件到内存列表 ─────────
+function appendFilesToList(files) {
+    const isFirst = _allFiles.length === 0;
 
     files.forEach(f => {
-        const row = document.createElement("div");
-        row.className = "file-row";
-        if (f.status === "dup") row.classList.add("dup-row");
-        if (f.status === "keep") row.classList.add("keep-row");
-
-        const nameSpan = document.createElement("span");
-        nameSpan.className = "f-name";
-        nameSpan._fullText = f.name;
-        nameSpan.textContent = f.name;
-
-        const sizeSpan = document.createElement("span");
-        sizeSpan.className = "f-size";
-        sizeSpan.textContent = f.size_str;
-
-        const pathSpan = document.createElement("span");
-        pathSpan.className = "f-path";
-        pathSpan._fullText = f.rel;
-        pathSpan.textContent = f.rel;
-
-        row.appendChild(nameSpan);
-        row.appendChild(sizeSpan);
-        row.appendChild(pathSpan);
-
-        row.addEventListener("contextmenu", (e) => {
-            showContextMenu(e, f.path);
+        const parts = f.path.replace(/\\/g, "/").split("/");
+        const fileName = parts[parts.length - 1] || f.path;
+        const parentDir = parts.length > 1 ? parts[parts.length - 2] : "";
+        const isHashError = f.status === "hash_error";
+        _allFiles.push({
+            path: f.path,
+            name: fileName,
+            size: f.size,
+            size_str: formatFileSize(f.size),
+            rel: parentDir,  // 增量阶段先显示父目录，扫描完成后更新为完整相对路径
+            status: isHashError ? "hash_error" : "normal",
         });
-        leftFileList.appendChild(row);
+        if (isHashError) _hashFailCount++;
+        else _hashSuccessCount++;
     });
+
+    // 首次增量更新时显示列头、隐藏占位符、显示分页栏和筛选框
+    if (isFirst) {
+        leftPlaceholder.style.display = "none";
+        leftColHeaders.style.display = "flex";
+        paginationBar.style.display = "flex";
+        hashFilter.style.display = "inline-block";
+    }
+
+    // 更新文件计数和 hash 统计
+    _updateFileCountDisplay();
+
+    // 如果新增文件落在当前页或之前的页，重新渲染当前页
+    renderCurrentPage();
+}
+
+// ───────── 更新文件计数和 hash 统计显示 ─────────
+function _updateFileCountDisplay() {
+    fileCount.textContent = `共 ${_allFiles.length} 个文件`;
+    if (_hashFailCount > 0 || _hashSuccessCount > 0) {
+        hashStats.innerHTML = `Hash 成功：<span class="hash-ok">${_hashSuccessCount}</span>，Hash 失败：<span class="hash-fail">${_hashFailCount}</span>`;
+    } else {
+        hashStats.innerHTML = "";
+    }
+}
+
+// ───────── 渲染当前页文件列表 ─────────
+function renderCurrentPage() {
+    // 根据 hash 筛选
+    let filteredFiles = _allFiles;
+    if (_hashFilterValue === "success") {
+        filteredFiles = _allFiles.filter(f => f.status !== "hash_error");
+    } else if (_hashFilterValue === "fail") {
+        filteredFiles = _allFiles.filter(f => f.status === "hash_error");
+    }
+
+    const totalPages = Math.max(1, Math.ceil(filteredFiles.length / _pageSize));
+    if (_currentPage > totalPages) _currentPage = totalPages;
+
+    const start = (_currentPage - 1) * _pageSize;
+    const end = Math.min(start + _pageSize, filteredFiles.length);
+    const pageFiles = filteredFiles.slice(start, end);
+
+    leftFileList.innerHTML = "";
+
+    if (pageFiles.length > 0) {
+        const fragment = document.createDocumentFragment();
+        pageFiles.forEach(f => {
+            const row = document.createElement("div");
+            row.className = "file-row";
+            if (f.status === "dup") row.classList.add("dup-row");
+            if (f.status === "keep") row.classList.add("keep-row");
+            if (f.status === "hash_error") row.classList.add("hash-error-row");
+
+            const nameSpan = document.createElement("span");
+            nameSpan.className = "f-name";
+            nameSpan._fullText = f.name;
+            nameSpan.textContent = f.status === "hash_error" ? "⚠ " + f.name : f.name;
+
+            const sizeSpan = document.createElement("span");
+            sizeSpan.className = "f-size";
+            sizeSpan.textContent = f.size_str;
+
+            const hashSpan = document.createElement("span");
+            hashSpan.className = "f-hash";
+            if (f.status === "hash_error") {
+                hashSpan.textContent = "失败";
+                hashSpan.classList.add("hash-fail");
+            } else {
+                hashSpan.textContent = "成功";
+            }
+
+            const pathSpan = document.createElement("span");
+            pathSpan.className = "f-path";
+            pathSpan._fullText = f.rel;
+            pathSpan.textContent = f.rel;
+
+            row.appendChild(nameSpan);
+            row.appendChild(sizeSpan);
+            row.appendChild(hashSpan);
+            row.appendChild(pathSpan);
+
+            row.addEventListener("contextmenu", (e) => {
+                showContextMenu(e, f.path);
+            });
+
+            fragment.appendChild(row);
+        });
+        leftFileList.appendChild(fragment);
+    }
+
+    // 更新分页控件
+    pageInfo.textContent = `第 ${_currentPage} / ${totalPages} 页`;
+    btnPrevPage.disabled = _currentPage <= 1;
+    btnNextPage.disabled = _currentPage >= totalPages;
+
+    // 无文件时隐藏分页栏
+    if (_allFiles.length === 0) {
+        paginationBar.style.display = "none";
+    }
 
     applyColumnWidths("left");
 }
 
-// ───────── 渲染右侧重复组 ─────────
+// ───────── 分页导航事件 ─────────
+btnPrevPage.addEventListener("click", () => {
+    if (_currentPage > 1) {
+        _currentPage--;
+        renderCurrentPage();
+    }
+});
+
+btnNextPage.addEventListener("click", () => {
+    let filteredLen = _allFiles.length;
+    if (_hashFilterValue === "success") {
+        filteredLen = _allFiles.filter(f => f.status !== "hash_error").length;
+    } else if (_hashFilterValue === "fail") {
+        filteredLen = _allFiles.filter(f => f.status === "hash_error").length;
+    }
+    const totalPages = Math.ceil(filteredLen / _pageSize);
+    if (_currentPage < totalPages) {
+        _currentPage++;
+        renderCurrentPage();
+    }
+});
+
+// ───────── Hash 筛选下拉框 ─────────
+hashFilter.addEventListener("change", () => {
+    _hashFilterValue = hashFilter.value;
+    _currentPage = 1;  // 切换筛选时回到第一页
+    renderCurrentPage();
+});
+
+// ───────── 渲染右侧重复组（保存数据 + 分页渲染） ─────────
+let _allDupGroups = [];  // 所有重复组数据（内存中维护）
+
 function renderDuplicateGroups(groups) {
-    rightFileList.innerHTML = "";
+    _allDupGroups = groups;
+    _dupCurrentPage = 1;
 
     if (groups.length === 0) {
         rightColHeaders.style.display = "none";
+        rightPaginationBar.style.display = "none";
+        rightFileList.innerHTML = "";
         return;
     }
 
     rightColHeaders.style.display = "flex";
+    rightPaginationBar.style.display = "flex";
+    renderCurrentDupPage();
+}
+
+// ───────── 渲染当前页重复组 ────────
+function renderCurrentDupPage() {
+    const totalPages = Math.max(1, Math.ceil(_allDupGroups.length / _dupPageSize));
+    if (_dupCurrentPage > totalPages) _dupCurrentPage = totalPages;
+
+    const start = (_dupCurrentPage - 1) * _dupPageSize;
+    const end = Math.min(start + _dupPageSize, _allDupGroups.length);
+    const pageGroups = _allDupGroups.slice(start, end);
+
+    rightFileList.innerHTML = "";
 
     const isManual = scanData && scanData.keep_rule === "manual";
 
-    groups.forEach(g => {
+    pageGroups.forEach(g => {
         const groupDiv = document.createElement("div");
         groupDiv.className = "dup-group";
 
@@ -675,7 +918,6 @@ function renderDuplicateGroups(groups) {
             row.dataset.path = f.path;
             row.dataset.keep = f.is_keep ? "1" : "0";
 
-            // 手动模式：默认不选中任何文件；自动模式：非保留文件默认选中
             const isDelete = isManual ? false : !f.is_keep;
             if (isDelete) row.classList.add("delete-row");
             if (f.is_keep && !isManual) row.classList.add("keep-row");
@@ -703,6 +945,10 @@ function renderDuplicateGroups(groups) {
             sizeSpan.className = "f-size";
             sizeSpan.textContent = f.size_str;
 
+            const hashSpan = document.createElement("span");
+            hashSpan.className = "f-hash";
+            hashSpan.textContent = "成功";
+
             const pathSpan = document.createElement("span");
             pathSpan.className = "f-path";
             pathSpan._fullText = f.rel;
@@ -711,6 +957,7 @@ function renderDuplicateGroups(groups) {
             row.appendChild(cb);
             row.appendChild(nameSpan);
             row.appendChild(sizeSpan);
+            row.appendChild(hashSpan);
             row.appendChild(pathSpan);
 
             row.addEventListener("contextmenu", (e) => {
@@ -734,9 +981,30 @@ function renderDuplicateGroups(groups) {
         rightFileList.appendChild(groupDiv);
     });
 
+    // 更新分页控件
+    dupPageInfo.textContent = `第 ${_dupCurrentPage} / ${totalPages} 页`;
+    btnDupPrevPage.disabled = _dupCurrentPage <= 1;
+    btnDupNextPage.disabled = _dupCurrentPage >= totalPages;
+
     applyColumnWidths("right");
     updateDeleteSummary();
 }
+
+// ───────── 重复组翻页事件 ─────────
+btnDupPrevPage.addEventListener("click", () => {
+    if (_dupCurrentPage > 1) {
+        _dupCurrentPage--;
+        renderCurrentDupPage();
+    }
+});
+
+btnDupNextPage.addEventListener("click", () => {
+    const totalPages = Math.ceil(_allDupGroups.length / _dupPageSize);
+    if (_dupCurrentPage < totalPages) {
+        _dupCurrentPage++;
+        renderCurrentDupPage();
+    }
+});
 
 function updateDeleteSummary() {
     if (!scanData) return;
@@ -926,7 +1194,22 @@ function escapeHtml(str) {
             if (detail.error) return;
 
             scanData = detail;
-            renderAllFiles(detail.all_files);
+
+            // 填充 _allFiles 并使用分页渲染
+            _allFiles = detail.all_files.map(f => ({
+                path: f.path,
+                name: f.name,
+                size: f.size,
+                size_str: f.size_str,
+                rel: f.rel,
+                status: f.status || "normal",
+            }));
+            _currentPage = 1;
+            leftPlaceholder.style.display = "none";
+            leftColHeaders.style.display = "flex";
+            paginationBar.style.display = "flex";
+
+            renderCurrentPage();
             renderDuplicateGroups(detail.duplicate_groups);
             fileCount.textContent = `共 ${detail.total_files} 个文件`;
 
