@@ -180,6 +180,7 @@ initColumnResize();
 
 // ───────── 路径浏览 ─────────
 let browsePath = "";
+let browseDebounceTimer = null;
 
 async function browseDir() {
     try {
@@ -188,11 +189,25 @@ async function browseDir() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ path: browsePath }),
         });
+        if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            const errMsg = errData.error || resp.statusText || `HTTP ${resp.status}`;
+            console.error("[browseDir] API 返回错误:", errMsg);
+            showToast("浏览目录失败: " + errMsg);
+            return;
+        }
         const data = await resp.json();
+        if (data.error) {
+            console.error("[browseDir] 服务端错误:", data.error);
+            showToast("浏览目录失败: " + data.error);
+            return;
+        }
+        console.log("[browseDir] 成功获取目录列表:", data.path, "条目数:", data.entries?.length || 0);
         browsePath = data.path;
-        renderDropdown(data.entries, data.path);
+        renderDropdown(data.entries || [], data.path);
     } catch (e) {
-        showToast("浏览目录失败");
+        console.error("[browseDir] 异常:", e);
+        showToast("浏览目录失败: " + e.message);
     }
 }
 
@@ -205,10 +220,15 @@ function renderDropdown(entries, currentPath) {
         parent.innerHTML = '<span class="icon">📂</span> .. (上级目录)';
         parent.addEventListener("click", () => {
             if (currentPath.includes(":\\") || currentPath.includes(":/")) {
+                // Windows 路径：去掉末尾分隔符后找最后一个分隔符
                 const parentPath = currentPath.replace(/[\\\/]$/, "");
                 const lastSep = Math.max(parentPath.lastIndexOf("\\"), parentPath.lastIndexOf("/"));
-                if (lastSep <= 2) {
+                if (lastSep < 0) {
+                    // "C:" 这种无分隔符形式，回到盘符列表
                     browsePath = "";
+                } else if (lastSep <= 2) {
+                    // "C:\foo" → 上级是 "C:\"
+                    browsePath = parentPath.substring(0, lastSep) + "\\";
                 } else {
                     browsePath = parentPath.substring(0, lastSep);
                 }
@@ -246,8 +266,11 @@ folderInput.addEventListener("focus", () => {
 });
 
 folderInput.addEventListener("input", () => {
-    const val = folderInput.value.trim();
-    if (val) { browsePath = val; browseDir(); }
+    clearTimeout(browseDebounceTimer);
+    browseDebounceTimer = setTimeout(() => {
+        const val = folderInput.value.trim();
+        if (val) { browsePath = val; browseDir(); }
+    }, 500);
 });
 
 document.addEventListener("click", (e) => {
@@ -425,7 +448,12 @@ function handleProgress(msg) {
             break;
         case "progress":
             progressFill.style.width = msg.progress + "%";
-            progressText.textContent = `正在计算文件哈希… ${msg.current} / ${msg.total}`;
+            // 根据当前阶段显示不同的进度文本
+            if (msg.total_files && msg.current_files !== undefined) {
+                progressText.textContent = `${progressText.textContent} ${msg.current_files}/${msg.total_files}`;
+            } else if (msg.current && msg.total) {
+                progressText.textContent = `${progressText.textContent} ${msg.current} / ${msg.total}`;
+            }
             break;
         case "paused":
             progressText.textContent = "⏸ 扫描已暂停";
@@ -851,3 +879,76 @@ function escapeHtml(str) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
 }
+
+// ───────── 页面加载：恢复上次扫描状态 ─────────
+(async function restoreLastScan() {
+    try {
+        const resp = await fetch("/api/scan/latest");
+        const data = await resp.json();
+        if (!data.scan_id) return;
+
+        const status = data.status;
+        const paused = data.paused;
+        scanId = data.scan_id;
+        folderInput.value = data.folder || "";
+
+        // 运行中或暂停：恢复进度条 UI 并重新连接 SSE
+        if (status === "running" || status === "paused") {
+            progressArea.style.display = "block";
+            progressFill.style.width = "0%";
+            progressText.textContent = paused ? "⏸ 扫描已暂停" : "正在恢复连接…";
+            progressText.style.color = paused ? "#f39c12" : "";
+            btnScan.disabled = true;
+            btnRescan.disabled = true;
+            btnStop.disabled = false;
+            btnPause.disabled = false;
+            btnPause.textContent = paused ? "▶ 继续" : "⏸ 暂停";
+            listenProgress(scanId);
+            return;
+        }
+
+        // 已停止或出错：显示终止状态
+        if (status === "cancelled" || status === "error") {
+            progressArea.style.display = "block";
+            progressText.textContent = status === "cancelled" ? "扫描已停止" : "扫描出错";
+            progressText.style.color = status === "cancelled" ? "#e67e22" : "#f44747";
+            btnScan.disabled = false;
+            btnRescan.disabled = false;
+            btnPause.disabled = true;
+            btnStop.disabled = true;
+            return;
+        }
+
+        // 已完成：拉取详情并渲染结果
+        if (status === "done") {
+            const detailResp = await fetch(`/api/scan/${data.scan_id}/details`);
+            const detail = await detailResp.json();
+            if (detail.error) return;
+
+            scanData = detail;
+            renderAllFiles(detail.all_files);
+            renderDuplicateGroups(detail.duplicate_groups);
+            fileCount.textContent = `共 ${detail.total_files} 个文件`;
+
+            if (detail.total_groups === 0) {
+                rightPlaceholder.style.display = "block";
+                rightColHeaders.style.display = "none";
+                rightPlaceholder.textContent = "✓  没有发现重复文件";
+                rightPlaceholder.style.color = "#27ae60";
+                rightPlaceholder.style.fontSize = "16px";
+            } else {
+                rightPlaceholder.style.display = "none";
+                rightColHeaders.style.display = "flex";
+                dupCount.textContent = `${detail.total_groups} 组重复`;
+                btnDelete.disabled = false;
+            }
+
+            btnRescan.disabled = false;
+            summaryText.textContent = detail.total_groups > 0
+                ? `上次扫描：${detail.total_groups} 组重复`
+                : "上次扫描：未发现重复文件";
+        }
+    } catch (_) {
+        // 恢复失败则保持初始状态，静默处理
+    }
+})();

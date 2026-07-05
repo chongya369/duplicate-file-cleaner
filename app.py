@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-重复文件检测清理工具 Web 版 v0.6.0
+重复文件检测清理工具 Web 版 v0.7.0
 使用 Flask + SSE 提供实时扫描进度。
 
 启动方式:
@@ -30,6 +30,13 @@ v0.6.0 更新:
     - 新增停止扫描功能（进度条右侧停止按钮）
     - 新增暂停/继续扫描功能
     - 新增自动扫描模式（选择文件夹后自动开始扫描，偏好持久化到 localStorage）
+
+v0.7.0 更新:
+    - 新增恢复上次扫描结果（重新打开网页自动加载最近一次扫描）
+
+v0.7.1 更新:
+    - 两阶段哈希：先 partial hash 快速筛选，仅对疑似重复文件做全量 SHA-256
+    - 多线程并行哈希，充分利用多核 CPU 加速大文件库扫描
 """
 
 import os
@@ -45,6 +52,7 @@ import logging
 import traceback
 import secrets
 import functools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 
@@ -52,7 +60,7 @@ import yaml
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context, redirect, make_response
 
 # ────────────────── 版本 ──────────────────
-__version__ = "0.6.0"
+__version__ = "0.7.1"
 
 # ────────────────── 配置 ──────────────────
 DEFAULT_PORT = 36901
@@ -182,9 +190,11 @@ AUTH_COOKIE = 'dupfinder_session'
 
 
 def require_auth(f):
-    """路由装饰器：校验会话 Cookie，未认证时返回 401"""
+    """路由装饰器：校验会话 Cookie，未认证时返回 401；未设置密码时直接放行"""
     @functools.wraps(f)
     def decorated(*args, **kwargs):
+        if not _config.get('password'):
+            return f(*args, **kwargs)
         token = request.cookies.get(AUTH_COOKIE)
         if not secrets.compare_digest(token or '', _session_token):
             if request.is_json:
@@ -210,8 +220,28 @@ def _new_scan_id():
 
 # ────────────────── 工具函数 ──────────────────
 
+def compute_partial_hash(filepath, chunk_size=65536):
+    """计算文件前 1MB 的 SHA-256 作为快速指纹，用于两阶段哈希的第一阶段筛选。
+    不同文件的前 1MB 几乎不可能相同，可大幅减少需要全量哈希的文件数。
+    失败返回 None"""
+    sha256 = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            remaining = 1048576  # 1 MB
+            while remaining > 0:
+                read_size = min(chunk_size, remaining)
+                chunk = f.read(read_size)
+                if not chunk:
+                    break
+                sha256.update(chunk)
+                remaining -= len(chunk)
+        return sha256.hexdigest()
+    except (OSError, PermissionError):
+        return None
+
+
 def compute_file_hash(filepath, chunk_size=65536):
-    """计算文件 SHA-256，返回十六进制字符串；失败返回 None"""
+    """计算文件完整 SHA-256，返回十六进制字符串；失败返回 None"""
     sha256 = hashlib.sha256()
     try:
         with open(filepath, "rb") as f:
@@ -338,9 +368,11 @@ def login():
             return resp
         return redirect('/login?error=1')
 
-    # 无需密码时直接跳转首页
+    # 无需密码时直接设置 Cookie 并跳转首页
     if not _config.get('password'):
-        return redirect('/')
+        resp = make_response(redirect('/'))
+        resp.set_cookie(AUTH_COOKIE, _session_token, httponly=True, samesite='Lax')
+        return resp
 
     return _LOGIN_HTML
 
@@ -357,9 +389,11 @@ def logout():
 
 @app.route("/")
 def index():
-    # 无需密码时跳过认证
+    # 无需密码时跳过认证，但仍需设置 Cookie 以便 API 调用
     if not _config.get('password'):
-        return render_template("index.html", version=__version__)
+        resp = make_response(render_template("index.html", version=__version__))
+        resp.set_cookie(AUTH_COOKIE, _session_token, httponly=True, samesite='Lax')
+        return resp
     token = request.cookies.get(AUTH_COOKIE)
     if not secrets.compare_digest(token or '', _session_token):
         return redirect('/login')
@@ -503,37 +537,137 @@ def _run_scan(scan_id, folder, recursive, skip_empty, keep_rule="shortest"):
                     _sessions[scan_id]["status"] = "done"
             return
 
-        # 阶段 3：计算哈希
-        hash_groups = defaultdict(list)
-        done = 0
-        done_bytes = 0
+        # 阶段 3：两阶段哈希（先 partial hash 快速筛选，再全量哈希确认）
+        n_workers = max(2, os.cpu_count() or 2)
         hash_errors = 0
-        for _sz, paths in candidates.items():
-            for fp in paths:
-                # 检查是否已取消或暂停
-                if _wait_if_paused():
-                    q.put(json.dumps({"type": "cancelled", "message": "扫描已停止"}))
-                    with _session_lock:
-                        if scan_id in _sessions:
-                            _sessions[scan_id]["status"] = "cancelled"
-                    return
-                h = compute_file_hash(fp)
+
+        # ── 阶段 3a：并行计算 partial hash，快速排除唯一文件 ──
+        q.put(json.dumps({
+            "type": "phase",
+            "phase": "partial_hash",
+            "message": f"正在快速筛选文件指纹（{n_workers} 线程并行）…",
+            "file_count": total_candidates,
+        }))
+
+        partial_groups = defaultdict(list)   # partial_hash -> [(fp, sz), ...]
+        partial_done = 0
+        partial_lock = threading.Lock()
+
+        def _worker_partial(item):
+            fp, sz = item
+            with _session_lock:
+                session = _sessions.get(scan_id)
+                if session and session.get("cancel_requested"):
+                    return None
+            h = compute_partial_hash(fp)
+            with partial_lock:
+                nonlocal partial_done
+                partial_done += 1
+                pct = int(partial_done / total_candidates * 100)
+                q.put(json.dumps({
+                    "type": "progress",
+                    "progress": pct,
+                    "current": f"{partial_done}/{total_candidates}",
+                    "total": f"{total_candidates} 个候选文件",
+                    "current_files": partial_done,
+                    "total_files": total_candidates,
+                }))
+            return (fp, sz, h)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            all_items = [(fp, sz) for sz, paths in candidates.items() for fp in paths]
+            futures = {pool.submit(_worker_partial, item): item for item in all_items}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue  # cancelled
+                fp, sz, h = result
+                if h:
+                    partial_groups[h].append((fp, sz))
+                else:
+                    with partial_lock:
+                        hash_errors += 1
+                    logger.debug("Partial hash 失败: %s", fp)
+
+        # 检查取消
+        with _session_lock:
+            session = _sessions.get(scan_id)
+            if session and session.get("cancel_requested"):
+                q.put(json.dumps({"type": "cancelled", "message": "扫描已停止"}))
+                session["status"] = "cancelled"
+                return
+
+        # 仅保留 partial hash 相同的文件组（>=2 个文件），其余直接排除
+        need_full_hash = {h: items for h, items in partial_groups.items() if len(items) > 1}
+        full_hash_candidates = sum(len(v) for v in need_full_hash.values())
+        skipped = total_candidates - full_hash_candidates
+
+        if skipped > 0:
+            logger.info("Partial hash 筛选：跳过 %d 个唯一文件，剩余 %d 个需全量哈希", skipped, full_hash_candidates)
+
+        if full_hash_candidates == 0:
+            q.put(json.dumps({
+                "type": "done",
+                "duplicate_groups": [],
+                "total_groups": 0,
+                "duplicate_count": 0,
+                "space_saved": "0 B",
+                "message": "未发现重复文件（所有文件大小或内容均唯一）",
+            }))
+            with _session_lock:
+                if scan_id in _sessions:
+                    _sessions[scan_id]["status"] = "done"
+            return
+
+        # ── 阶段 3b：对筛选后的文件并行计算全量 SHA-256 ──
+        q.put(json.dumps({
+            "type": "phase",
+            "phase": "full_hash",
+            "message": f"正在计算文件哈希（{full_hash_candidates} 个文件，{n_workers} 线程并行）…",
+            "file_count": full_hash_candidates,
+        }))
+
+        hash_groups = defaultdict(list)
+        full_done = 0
+        full_done_bytes = 0
+        full_lock = threading.Lock()
+
+        def _worker_full(item):
+            fp, sz = item
+            with _session_lock:
+                session = _sessions.get(scan_id)
+                if session and session.get("cancel_requested"):
+                    return None
+            h = compute_file_hash(fp)
+            with full_lock:
+                nonlocal full_done, full_done_bytes
+                full_done += 1
+                full_done_bytes += sz
+                pct = int(full_done_bytes / total_bytes * 100) if total_bytes > 0 else 100
+                q.put(json.dumps({
+                    "type": "progress",
+                    "progress": pct,
+                    "current": format_size(full_done_bytes),
+                    "total": format_size(total_bytes),
+                    "current_files": full_done,
+                    "total_files": full_hash_candidates,
+                }))
+            return (fp, h)
+
+        full_items = [(fp, sz) for items in need_full_hash.values() for fp, sz in items]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_worker_full, item): item for item in full_items}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue
+                fp, h = result
                 if h:
                     hash_groups[h].append(fp)
                 else:
-                    hash_errors += 1
-                    logger.debug("哈希计算失败（权限拒绝或文件被锁）: %s", fp)
-                done += 1
-                done_bytes += _sz
-                progress_pct = int(done_bytes / total_bytes * 100) if total_bytes > 0 else 100
-                q.put(json.dumps({
-                    "type": "progress",
-                    "progress": progress_pct,
-                    "current": format_size(done_bytes),
-                    "total": format_size(total_bytes),
-                    "current_files": done,
-                    "total_files": total_candidates,
-                }))
+                    with full_lock:
+                        hash_errors += 1
+                    logger.debug("全量哈希失败: %s", fp)
 
         if hash_errors > 0:
             logger.warning("扫描 %s: %d 个文件哈希计算失败（已跳过）", folder, hash_errors)
@@ -672,6 +806,26 @@ def api_scan_pause(scan_id):
     action = "暂停" if is_paused else "继续"
     logger.info("用户%s扫描 scan_id=%s", action, scan_id)
     return jsonify({"ok": True, "paused": is_paused})
+
+
+@app.route("/api/scan/latest")
+@require_auth
+def api_scan_latest():
+    """返回最近一次扫描的信息（任意状态），用于页面恢复"""
+    with _session_lock:
+        if _scan_counter <= 0:
+            return jsonify({"scan_id": None})
+        latest_id = f"scan_{_scan_counter}"
+        session = _sessions.get(latest_id)
+        if not session:
+            return jsonify({"scan_id": None})
+        return jsonify({
+            "scan_id": latest_id,
+            "folder": session["folder"],
+            "status": session["status"],
+            "paused": session.get("paused", False),
+        })
+    return jsonify({"scan_id": None})
 
 
 @app.route("/api/scan/<scan_id>/details")
@@ -885,6 +1039,7 @@ def api_browse():
     """返回指定目录的子目录列表（跨平台自适应）"""
     data = request.get_json(force=True)
     path = data.get("path", "").strip()
+    logger.debug("[api/browse] 请求路径: %r", path)
 
     # Windows: 如果路径为空或 /，返回所有盘符
     if (not path or path == "/") and sys.platform.startswith("win"):
@@ -893,6 +1048,7 @@ def api_browse():
             drive = chr(d) + ":\\"
             if os.path.exists(drive):
                 drives.append({"name": drive, "path": drive})
+        logger.debug("[api/browse] Windows 盘符列表: %d 个", len(drives))
         return jsonify({"path": "", "entries": drives, "is_drives": True})
 
     # Linux/macOS 根目录
@@ -901,6 +1057,7 @@ def api_browse():
 
     try:
         if not os.path.isdir(path):
+            logger.warning("[api/browse] 路径不是有效目录: %r，回退到默认目录", path)
             # Windows: 如果路径不存在，回退到用户目录
             if sys.platform.startswith("win"):
                 path = os.path.expanduser("~")
@@ -911,11 +1068,16 @@ def api_browse():
             full = os.path.join(path, name)
             if os.path.isdir(full) and not name.startswith("."):
                 entries.append({"name": name, "path": full})
+        logger.debug("[api/browse] 目录 %r 包含 %d 个子目录", path, len(entries))
         return jsonify({"path": path, "entries": entries})
-    except (OSError, PermissionError) as e:
-        logger.warning("浏览目录失败 %s: %s", path, e)
+    except PermissionError as e:
+        logger.error("[api/browse] 权限不足: %r - %s", path, e)
         home = os.path.expanduser("~")
-        return jsonify({"path": home, "entries": []})
+        return jsonify({"path": home, "entries": [], "error": f"无权访问该目录: {path}"}), 403
+    except OSError as e:
+        logger.error("[api/browse] 读取目录失败: %r - %s", path, e)
+        home = os.path.expanduser("~")
+        return jsonify({"path": home, "entries": [], "error": f"读取目录失败: {str(e)}"}), 500
 
 
 # ────────────────── 入口 ──────────────────
