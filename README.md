@@ -72,7 +72,7 @@ server:
 
 ## dokcer镜像名：chongya369/dedup
 
-##docker compose快速部署
+## docker compose快速部署
 
 ```yaml
 # 重复文件检测清理工具 - Docker 快速部署
